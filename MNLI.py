@@ -238,7 +238,7 @@ backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
 model = Model(backbond).to(device)
 loss_funtion = nn.CrossEntropyLoss()
 lr = 0.0001
-optimizer = optim.AdamW(model.param_lst, lr = lr)
+optimizer = optim.AdamW(model.parameters(), lr = lr)
 path = sys.argv[1]
 model_m_path = os.path.join(path, 'MNLI_m.ckpt')
 model_mm_path = os.path.join(path, 'MNLI_mm.ckpt')
