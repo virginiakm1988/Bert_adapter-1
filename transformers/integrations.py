@@ -17,16 +17,14 @@ Integrations with other Python libraries.
 import importlib.util
 import io
 import json
-import math
 import numbers
 import os
-import re
 import tempfile
+from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
 
-from .trainer_utils import SchedulerType
 from .utils import logging
+from .utils.versions import require_version
 
 
 logger = logging.get_logger(__name__)
@@ -49,12 +47,17 @@ if _has_comet:
 
 from .file_utils import ENV_VARS_TRUE_VALUES, is_torch_tpu_available  # noqa: E402
 from .trainer_callback import TrainerCallback  # noqa: E402
-from .trainer_utils import PREFIX_CHECKPOINT_DIR, BestRun, EvaluationStrategy  # noqa: E402
+from .trainer_utils import PREFIX_CHECKPOINT_DIR, BestRun, IntervalStrategy  # noqa: E402
 
 
 # Integration functions:
 def is_wandb_available():
-    if os.getenv("WANDB_DISABLED"):
+    # any value of WANDB_DISABLED disables wandb
+    if os.getenv("WANDB_DISABLED", "").upper() in ENV_VARS_TRUE_VALUES:
+        logger.warn(
+            "Using the `WAND_DISABLED` environment variable is deprecated and will be removed in v5. Use the "
+            "--report_to flag to control the integrations used for logging result (for instance --report_to none)."
+        )
         return False
     return importlib.util.find_spec("wandb") is not None
 
@@ -125,13 +128,13 @@ def run_hp_search_optuna(trainer, n_trials: int, direction: str, **kwargs) -> Be
     import optuna
 
     def _objective(trial, checkpoint_dir=None):
-        model_path = None
+        checkpoint = None
         if checkpoint_dir:
             for subdir in os.listdir(checkpoint_dir):
                 if subdir.startswith(PREFIX_CHECKPOINT_DIR):
-                    model_path = os.path.join(checkpoint_dir, subdir)
+                    checkpoint = os.path.join(checkpoint_dir, subdir)
         trainer.objective = None
-        trainer.train(model_path=model_path, trial=trial)
+        trainer.train(resume_from_checkpoint=checkpoint, trial=trial)
         # If there hasn't been any evaluation during the training loop.
         if getattr(trainer, "objective", None) is None:
             metrics = trainer.evaluate()
@@ -149,36 +152,43 @@ def run_hp_search_optuna(trainer, n_trials: int, direction: str, **kwargs) -> Be
 def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestRun:
     import ray
 
-    def _objective(trial, checkpoint_dir=None):
-        model_path = None
+    def _objective(trial, local_trainer, checkpoint_dir=None):
+        checkpoint = None
         if checkpoint_dir:
             for subdir in os.listdir(checkpoint_dir):
                 if subdir.startswith(PREFIX_CHECKPOINT_DIR):
-                    model_path = os.path.join(checkpoint_dir, subdir)
-        trainer.objective = None
-        trainer.train(model_path=model_path, trial=trial)
+                    checkpoint = os.path.join(checkpoint_dir, subdir)
+        local_trainer.objective = None
+        local_trainer.train(resume_from_checkpoint=checkpoint, trial=trial)
         # If there hasn't been any evaluation during the training loop.
-        if getattr(trainer, "objective", None) is None:
-            metrics = trainer.evaluate()
-            trainer.objective = trainer.compute_objective(metrics)
-            trainer._tune_save_checkpoint()
-            ray.tune.report(objective=trainer.objective, **metrics, done=True)
+        if getattr(local_trainer, "objective", None) is None:
+            metrics = local_trainer.evaluate()
+            local_trainer.objective = local_trainer.compute_objective(metrics)
+            local_trainer._tune_save_checkpoint()
+            ray.tune.report(objective=local_trainer.objective, **metrics, done=True)
 
     # The model and TensorBoard writer do not pickle so we have to remove them (if they exists)
     # while doing the ray hp search.
 
     _tb_writer = trainer.pop_callback(TensorBoardCallback)
     trainer.model = None
-    # Setup default `resources_per_trial` and `reporter`.
-    if "resources_per_trial" not in kwargs and trainer.args.n_gpu > 0:
-        # `args.n_gpu` is considered the total number of GPUs that will be split
-        # among the `n_jobs`
-        n_jobs = int(kwargs.pop("n_jobs", 1))
-        num_gpus_per_trial = trainer.args.n_gpu
-        if num_gpus_per_trial / n_jobs >= 1:
-            num_gpus_per_trial = int(math.ceil(num_gpus_per_trial / n_jobs))
-        kwargs["resources_per_trial"] = {"gpu": num_gpus_per_trial}
+    # Setup default `resources_per_trial`.
+    if "resources_per_trial" not in kwargs:
+        # Default to 1 CPU and 1 GPU (if applicable) per trial.
+        kwargs["resources_per_trial"] = {"cpu": 1}
+        if trainer.args.n_gpu > 0:
+            kwargs["resources_per_trial"]["gpu"] = 1
+        resource_msg = "1 CPU" + (" and 1 GPU" if trainer.args.n_gpu > 0 else "")
+        logger.info(
+            "No `resources_per_trial` arg was passed into "
+            "`hyperparameter_search`. Setting it to a default value "
+            f"of {resource_msg} for each trial."
+        )
+    # Make sure each trainer only uses GPUs that were allocated per trial.
+    gpus_per_trial = kwargs["resources_per_trial"].get("gpu", 0)
+    trainer.args._n_gpu = gpus_per_trial
 
+    # Setup default `progress_reporter`.
     if "progress_reporter" not in kwargs:
         from ray.tune import CLIReporter
 
@@ -188,7 +198,8 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
         trainer.use_tune_checkpoints = True
         if kwargs["keep_checkpoints_num"] > 1:
             logger.warning(
-                "Currently keeping {} checkpoints for each trial. Checkpoints are usually huge, "
+                f"Currently keeping {kwargs['keep_checkpoint_num']} checkpoints for each trial. "
+                "Checkpoints are usually huge, "
                 "consider setting `keep_checkpoints_num=1`."
             )
     if "scheduler" in kwargs:
@@ -207,7 +218,7 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
         # Check for `do_eval` and `eval_during_training` for schedulers that require intermediate reporting.
         if isinstance(
             kwargs["scheduler"], (ASHAScheduler, MedianStoppingRule, HyperBandForBOHB, PopulationBasedTraining)
-        ) and (not trainer.args.do_eval or trainer.args.evaluation_strategy == EvaluationStrategy.NO):
+        ) and (not trainer.args.do_eval or trainer.args.evaluation_strategy == IntervalStrategy.NO):
             raise RuntimeError(
                 "You are using {cls} as a scheduler but you haven't enabled evaluation during training. "
                 "This means your trials will not report intermediate results to Ray Tune, and "
@@ -217,12 +228,32 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
                 "Trainer `args`.".format(cls=type(kwargs["scheduler"]).__name__)
             )
 
-    analysis = ray.tune.run(_objective, config=trainer.hp_space(None), num_samples=n_trials, **kwargs)
+    analysis = ray.tune.run(
+        ray.tune.with_parameters(_objective, local_trainer=trainer),
+        config=trainer.hp_space(None),
+        num_samples=n_trials,
+        **kwargs,
+    )
     best_trial = analysis.get_best_trial(metric="objective", mode=direction[:3])
     best_run = BestRun(best_trial.trial_id, best_trial.last_result["objective"], best_trial.config)
     if _tb_writer is not None:
         trainer.add_callback(_tb_writer)
     return best_run
+
+
+def get_available_reporting_integrations():
+    integrations = []
+    if is_azureml_available():
+        integrations.append("azure_ml")
+    if is_comet_available():
+        integrations.append("comet_ml")
+    if is_mlflow_available():
+        integrations.append("mlflow")
+    if is_tensorboard_available():
+        integrations.append("tensorboard")
+    if is_wandb_available():
+        integrations.append("wandb")
+    return integrations
 
 
 def rewrite_logs(d):
@@ -237,24 +268,37 @@ def rewrite_logs(d):
     return new_d
 
 
-def init_deepspeed(trainer, num_training_steps):
+def init_deepspeed(trainer, num_training_steps, resume_from_checkpoint=None):
     """
-    Init DeepSpeed, after converting any relevant Trainer's args into DeepSpeed configuration
+    Init DeepSpeed, after updating the DeepSpeed configuration with any relevant Trainer's args.
+
+    If ``resume_from_checkpoint`` was passed then an attempt to resume from a previously saved checkpoint will be made.
 
     Args:
         trainer: Trainer object
         num_training_steps: per single gpu
+        resume_from_checkpoint: path to a checkpoint if to resume from after normal DeepSpeedEngine load
 
     Returns: model, optimizer, lr_scheduler
+
     """
     import deepspeed
+
+    require_version("deepspeed>0.3.12")
 
     args = trainer.args
     ds_config_file = args.deepspeed
     model = trainer.model
 
-    with io.open(ds_config_file, "r", encoding="utf-8") as f:
-        config = json.load(f)
+    if isinstance(args.deepspeed, dict):
+        # Don't modify user's data should they want to reuse it (e.g. in tests), because once we
+        # modified it, it will not be accepted here again, since some config params must be not set by users
+        config = deepcopy(args.deepspeed)
+    elif isinstance(args.deepspeed, str):
+        with io.open(ds_config_file, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    else:
+        raise ValueError("expecting either a path to a config file or a pre-populated dict")
 
     # The following code translates relevant trainer's cl args into the DS config
 
@@ -286,30 +330,49 @@ def init_deepspeed(trainer, num_training_steps):
     else:  # override only if the ds config doesn't already have this section
         config["gradient_clipping"] = args.max_grad_norm
 
+    # Optimizer + Scheduler
+    # Currently support combos:
+    # 1. DS scheduler + DS optimizer: Yes
+    # 2. HF scheduler + HF optimizer: Yes
+    # 3. DS scheduler + HF optimizer: Yes
+    # 4. HF scheduler + DS optimizer: No
+    # Unless Offload is enabled in which case it's:
+    # 1. DS scheduler + DS optimizer: Yes
+    # 2. HF scheduler + HF optimizer: No
+    # 3. DS scheduler + HF optimizer: No
+    # 4. HF scheduler + DS optimizer: No
+
+    optimizer = None
     if "optimizer" in config:
-        logger.info(
-            f"Keeping the `optimizer` config from {ds_config_file} intact, ignoring any optimizer-specific cl args"
+        logger.info(f"Updating the `scheduler` config from {ds_config_file} with other command line arguments")
+
+        # to avoid inconsistent values of lr and warm up steps the command line args override config
+        params = dict(
+            lr=args.learning_rate,
+            betas=[args.adam_beta1, args.adam_beta2],
+            eps=args.adam_epsilon,
+            weight_decay=args.weight_decay,
         )
+        for k, v in params.items():
+            if k in config["optimizer"]["params"]:
+                logger.info(f"setting optimizer.params.{k} to {v}")
+                config["optimizer"]["params"][k] = v
+
     else:  # override only if the ds config doesn't already have this section
-        # ds supports Adam, OneBitAdam, and Lamb optimizers and can import other optimizers from torch.
-        # But trainer uses AdamW by default.
-        # To use other optimizers so using a different scheduler requires voiding warranty with: `zero_allow_untested_optimizer`
-
-        optimizer_configs = {
-            "AdamW": {
-                "lr": args.learning_rate,
-                "betas": [args.adam_beta1, args.adam_beta2],
-                "eps": args.adam_epsilon,
-                "weight_decay": args.weight_decay,
-            }
-        }
-        optimizer = "AdamW"
-
-        config["zero_allow_untested_optimizer"] = True
-        config["optimizer"] = {
-            "type": optimizer,
-            "params": optimizer_configs[optimizer],
-        }
+        if (
+            "zero_optimization" in config
+            and "cpu_offload" in config["zero_optimization"]
+            and config["zero_optimization"]["cpu_offload"] is True
+        ):
+            raise ValueError("ZeRO Offload can only work with DeepSpeed optimizers")
+        else:
+            # ds supports Adam, OneBitAdam, and Lamb optimizers and can import other optimizers from torch.
+            # But trainer uses AdamW by default.
+            # To use other optimizers so using a different scheduler requires voiding warranty with: `zero_allow_untested_optimizer`
+            trainer.create_optimizer()
+            optimizer = trainer.optimizer
+            # flag that this is non-native optimizer
+            config["zero_allow_untested_optimizer"] = True
 
     # DS schedulers (deepspeed/runtime/lr_schedules.py):
     #
@@ -319,34 +382,33 @@ def init_deepspeed(trainer, num_training_steps):
     # OneCycle     | na                   | na                                | 1CLR
     # WarmupLR     | constant_with_warmup | get_constant_schedule_with_warmup | w/ warmup_min_lr=0
     # WarmupDecayLR| linear               | get_linear_schedule_with_warmup   |
+    lr_scheduler = None
     if "scheduler" in config:
-        logger.info(
-            f"Keeping the `scheduler` config from {ds_config_file} intact, ignoring any scheduler-specific cl args"
-        )
-    else:  # override only if the ds config doesn't already have this section
-        if args.lr_scheduler_type == SchedulerType.LINEAR:
-            scheduler = "WarmupDecayLR"
-            params = {
-                "last_batch_iteration": -1,
-                "total_num_steps": num_training_steps,
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.learning_rate,
-                "warmup_num_steps": args.warmup_steps,
-            }
-        elif args.lr_scheduler_type == SchedulerType.CONSTANT_WITH_WARMUP:
-            scheduler = "WarmupLR"
-            params = {
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.learning_rate,
-                "warmup_num_steps": args.warmup_steps,
-            }
-        else:
-            raise ValueError(f"{args.lr_scheduler_type} scheduler type is not supported by DeepSpeed")
+        logger.info(f"Updating the `scheduler` config from {ds_config_file} with other command line arguments")
+        # the user won't easily know the correct num_training_steps should they use WarmupDecayLR,
+        # so let's set it to the correct value
+        if config["scheduler"]["type"] == "WarmupDecayLR":
+            logger.info(f"setting scheduler.params.total_num_steps to {num_training_steps}")
+            config["scheduler"]["params"]["total_num_steps"] = num_training_steps
 
-        config["scheduler"] = {
-            "type": scheduler,
-            "params": params,
-        }
+        # to avoid inconsistent values of lr and warmup steps the command line args override config
+        params = dict(
+            warmup_max_lr=args.learning_rate,
+            warmup_num_steps=args.warmup_steps,
+        )
+        for k, v in params.items():
+            if k in config["scheduler"]["params"]:
+                logger.info(f"setting scheduler.params.{k} to {v}")
+                config["scheduler"]["params"][k] = v
+
+    else:  # override only if the ds config doesn't already have this section
+        if "optimizer" in config:
+            # to make this option work, we need to init DS optimizer first, then init HS scheduler,
+            # then pass the HS scheduler to DS init, which is not possible at the moment
+            raise ValueError("At the moment HF scheduler + DeepSpeed optimizer combination is not possible")
+        else:
+            trainer.create_scheduler(num_training_steps=num_training_steps)
+            lr_scheduler = trainer.lr_scheduler
 
     # fp16
     if trainer.fp16_backend is not None:
@@ -373,17 +435,27 @@ def init_deepspeed(trainer, num_training_steps):
                     "enabled": True,
                 }
 
-    # for clarity extract the specific cl args that are being passed to deepspeed
-    ds_args = dict(local_rank=args.local_rank)
+    # keep for quick debug:
+    # from pprint import pprint; pprint(config)
 
     # init that takes part of the config via `args`, and the bulk of it via `config_params`
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     model, optimizer, _, lr_scheduler = deepspeed.initialize(
-        args=SimpleNamespace(**ds_args),  # expects an obj
         model=model,
         model_parameters=model_parameters,
         config_params=config,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
     )
+
+    if resume_from_checkpoint is not None:  # and os.path.isdir(resume_from_checkpoint):
+        logger.info(f"Attempting to resume from {resume_from_checkpoint}")
+        # this magically updates self.optimizer and self.lr_scheduler
+        load_path, _ = model.load_checkpoint(
+            resume_from_checkpoint, load_optimizer_states=True, load_lr_scheduler_states=True
+        )
+        if load_path is None:
+            raise ValueError(f"[deepspeed] failed to resume from checkpoint {resume_from_checkpoint}")
 
     return model, optimizer, lr_scheduler
 
@@ -415,8 +487,9 @@ class TensorBoardCallback(TrainerCallback):
                     self._SummaryWriter = SummaryWriter
                 except ImportError:
                     self._SummaryWriter = None
+        else:
+            self._SummaryWriter = None
         self.tb_writer = tb_writer
-        self._SummaryWriter = SummaryWriter
 
     def _init_summary_writer(self, args, log_dir=None):
         log_dir = log_dir or args.logging_dir
@@ -460,12 +533,9 @@ class TensorBoardCallback(TrainerCallback):
                 else:
                     logger.warning(
                         "Trainer is attempting to log a value of "
-                        '"%s" of type %s for key "%s" as a scalar. '
+                        f'"{v}" of type {type(v)} for key "{k}" as a scalar. '
                         "This invocation of Tensorboard's writer.add_scalar() "
-                        "is incorrect so we dropped this attribute.",
-                        v,
-                        type(v),
-                        k,
+                        "is incorrect so we dropped this attribute."
                     )
             self.tb_writer.flush()
 
@@ -485,34 +555,29 @@ class WandbCallback(TrainerCallback):
         if has_wandb:
             import wandb
 
-            wandb.ensure_configured()
-            if wandb.api.api_key is None:
-                has_wandb = False
-                logger.warning(
-                    "W&B installed but not logged in. Run `wandb login` or set the WANDB_API_KEY env variable."
-                )
-                self._wandb = None
-            else:
-                self._wandb = wandb
+            self._wandb = wandb
         self._initialized = False
+        # log outputs
+        self._log_model = os.getenv("WANDB_LOG_MODEL", "FALSE").upper() in ENV_VARS_TRUE_VALUES.union({"TRUE"})
 
-    def setup(self, args, state, model, reinit, **kwargs):
+    def setup(self, args, state, model, **kwargs):
         """
         Setup the optional Weights & Biases (`wandb`) integration.
 
         One can subclass and override this method to customize the setup if needed. Find more information `here
-        <https://docs.wandb.com/huggingface>`__. You can also override the following environment variables:
+        <https://docs.wandb.ai/integrations/huggingface>`__. You can also override the following environment variables:
 
         Environment:
             WANDB_LOG_MODEL (:obj:`bool`, `optional`, defaults to :obj:`False`):
-                Whether or not to log model as artifact at the end of training.
+                Whether or not to log model as artifact at the end of training. Use along with
+                `TrainingArguments.load_best_model_at_end` to upload best model.
             WANDB_WATCH (:obj:`str`, `optional` defaults to :obj:`"gradients"`):
                 Can be :obj:`"gradients"`, :obj:`"all"` or :obj:`"false"`. Set to :obj:`"false"` to disable gradient
                 logging or :obj:`"all"` to log gradients and parameters.
             WANDB_PROJECT (:obj:`str`, `optional`, defaults to :obj:`"huggingface"`):
                 Set this to a custom string to store results in a different project.
             WANDB_DISABLED (:obj:`bool`, `optional`, defaults to :obj:`False`):
-                Whether or not to disable wandb entirely.
+                Whether or not to disable wandb entirely. Set `WANDB_DISABLED=true` to disable.
         """
         if self._wandb is None:
             return
@@ -534,13 +599,19 @@ class WandbCallback(TrainerCallback):
             else:
                 run_name = args.run_name
 
-            self._wandb.init(
-                project=os.getenv("WANDB_PROJECT", "huggingface"),
-                config=combined_dict,
-                name=run_name,
-                reinit=reinit,
-                **init_args,
-            )
+            if self._wandb.run is None:
+                self._wandb.init(
+                    project=os.getenv("WANDB_PROJECT", "huggingface"),
+                    name=run_name,
+                    **init_args,
+                )
+            # add config parameters (run may have been created manually)
+            self._wandb.config.update(combined_dict, allow_val_change=True)
+
+            # define default x-axis (for latest wandb versions)
+            if getattr(self._wandb, "define_metric", None):
+                self._wandb.define_metric("train/global_step")
+                self._wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
 
             # keep track of model topology and gradients, unsupported on TPU
             if not is_torch_tpu_available() and os.getenv("WANDB_WATCH") != "false":
@@ -548,29 +619,24 @@ class WandbCallback(TrainerCallback):
                     model, log=os.getenv("WANDB_WATCH", "gradients"), log_freq=max(100, args.logging_steps)
                 )
 
-            # log outputs
-            self._log_model = os.getenv("WANDB_LOG_MODEL", "FALSE").upper() in ENV_VARS_TRUE_VALUES.union({"TRUE"})
-
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if self._wandb is None:
             return
         hp_search = state.is_hyper_param_search
-        if not self._initialized or hp_search:
-            self.setup(args, state, model, reinit=hp_search, **kwargs)
+        if hp_search:
+            self._wandb.finish()
+        if not self._initialized:
+            self.setup(args, state, model, **kwargs)
 
     def on_train_end(self, args, state, control, model=None, tokenizer=None, **kwargs):
         if self._wandb is None:
             return
-        # commit last step
-        self._wandb.log({})
         if self._log_model and self._initialized and state.is_world_process_zero:
             from .trainer import Trainer
 
             fake_trainer = Trainer(args=args, model=model, tokenizer=tokenizer)
             with tempfile.TemporaryDirectory() as temp_dir:
                 fake_trainer.save_model(temp_dir)
-                # use run name and ensure it's a valid Artifact name
-                artifact_name = re.sub(r"[^a-zA-Z0-9_\.\-]", "", self._wandb.run.name)
                 metadata = (
                     {
                         k: v
@@ -583,7 +649,7 @@ class WandbCallback(TrainerCallback):
                         "train/total_floss": state.total_flos,
                     }
                 )
-                artifact = self._wandb.Artifact(name=f"run-{artifact_name}", type="model", metadata=metadata)
+                artifact = self._wandb.Artifact(name=f"model-{self._wandb.run.id}", type="model", metadata=metadata)
                 for f in Path(temp_dir).glob("*"):
                     if f.is_file():
                         with artifact.new_file(f.name, mode="wb") as fa:
@@ -594,10 +660,10 @@ class WandbCallback(TrainerCallback):
         if self._wandb is None:
             return
         if not self._initialized:
-            self.setup(args, state, model, reinit=False)
+            self.setup(args, state, model)
         if state.is_world_process_zero:
             logs = rewrite_logs(logs)
-            self._wandb.log(logs, step=state.global_step)
+            self._wandb.log({**logs, "train/global_step": state.global_step})
 
 
 class CometCallback(TrainerCallback):
@@ -685,11 +751,12 @@ class MLflowCallback(TrainerCallback):
     A :class:`~transformers.TrainerCallback` that sends the logs to `MLflow <https://www.mlflow.org/>`__.
     """
 
-    MAX_LOG_SIZE = 100
-
     def __init__(self):
         assert is_mlflow_available(), "MLflowCallback requires mlflow to be installed. Run `pip install mlflow`."
         import mlflow
+
+        self._MAX_PARAM_VAL_LENGTH = mlflow.utils.validation.MAX_PARAM_VAL_LENGTH
+        self._MAX_PARAMS_TAGS_PER_BATCH = mlflow.utils.validation.MAX_PARAMS_TAGS_PER_BATCH
 
         self._initialized = False
         self._log_artifacts = False
@@ -716,10 +783,21 @@ class MLflowCallback(TrainerCallback):
             if hasattr(model, "config") and model.config is not None:
                 model_config = model.config.to_dict()
                 combined_dict = {**model_config, **combined_dict}
+            # remove params that are too long for MLflow
+            for name, value in list(combined_dict.items()):
+                # internally, all values are converted to str in MLflow
+                if len(str(value)) > self._MAX_PARAM_VAL_LENGTH:
+                    logger.warning(
+                        f"Trainer is attempting to log a value of "
+                        f'"{value}" for key "{name}" as a parameter. '
+                        f"MLflow's log_param() only accepts values no longer than "
+                        f"250 characters so we dropped this attribute."
+                    )
+                    del combined_dict[name]
             # MLflow cannot log more than 100 values in one go, so we have to split it
             combined_dict_items = list(combined_dict.items())
-            for i in range(0, len(combined_dict_items), MLflowCallback.MAX_LOG_SIZE):
-                self._ml_flow.log_params(dict(combined_dict_items[i : i + MLflowCallback.MAX_LOG_SIZE]))
+            for i in range(0, len(combined_dict_items), self._MAX_PARAMS_TAGS_PER_BATCH):
+                self._ml_flow.log_params(dict(combined_dict_items[i : i + self._MAX_PARAMS_TAGS_PER_BATCH]))
         self._initialized = True
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
@@ -735,13 +813,10 @@ class MLflowCallback(TrainerCallback):
                     self._ml_flow.log_metric(k, v, step=state.global_step)
                 else:
                     logger.warning(
-                        "Trainer is attempting to log a value of "
-                        '"%s" of type %s for key "%s" as a metric. '
-                        "MLflow's log_metric() only accepts float and "
-                        "int types so we dropped this attribute.",
-                        v,
-                        type(v),
-                        k,
+                        f"Trainer is attempting to log a value of "
+                        f'"{v}" of type {type(v)} for key "{k}" as a metric. '
+                        f"MLflow's log_metric() only accepts float and "
+                        f"int types so we dropped this attribute."
                     )
 
     def on_train_end(self, args, state, control, **kwargs):
@@ -749,10 +824,27 @@ class MLflowCallback(TrainerCallback):
             if self._log_artifacts:
                 logger.info("Logging artifacts. This may take time.")
                 self._ml_flow.log_artifacts(args.output_dir)
-            self._ml_flow.end_run()
 
     def __del__(self):
         # if the previous run is not terminated correctly, the fluent API will
         # not let you start a new run before the previous one is killed
         if self._ml_flow.active_run is not None:
-            self._ml_flow.end_run(status="KILLED")
+            self._ml_flow.end_run()
+
+
+INTEGRATION_TO_CALLBACK = {
+    "azure_ml": AzureMLCallback,
+    "comet_ml": CometCallback,
+    "mlflow": MLflowCallback,
+    "tensorboard": TensorBoardCallback,
+    "wandb": WandbCallback,
+}
+
+
+def get_reporting_integration_callbacks(report_to):
+    for integration in report_to:
+        if integration not in INTEGRATION_TO_CALLBACK:
+            raise ValueError(
+                f"{integration} is not supported, only {', '.join(INTEGRATION_TO_CALLBACK.keys())} are supported."
+            )
+    return [INTEGRATION_TO_CALLBACK[integration] for integration in report_to]

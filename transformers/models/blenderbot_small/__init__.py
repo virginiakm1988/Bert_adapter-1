@@ -28,6 +28,7 @@ _import_structure = {
 if is_torch_available():
     _import_structure["modeling_blenderbot_small"] = [
         "BLENDERBOT_SMALL_PRETRAINED_MODEL_ARCHIVE_LIST",
+        "BlenderbotSmallForCausalLM",
         "BlenderbotSmallForConditionalGeneration",
         "BlenderbotSmallModel",
         "BlenderbotSmallPreTrainedModel",
@@ -46,13 +47,14 @@ if TYPE_CHECKING:
     if is_torch_available():
         from .modeling_blenderbot_small import (
             BLENDERBOT_SMALL_PRETRAINED_MODEL_ARCHIVE_LIST,
+            BlenderbotSmallForCausalLM,
             BlenderbotSmallForConditionalGeneration,
             BlenderbotSmallModel,
             BlenderbotSmallPreTrainedModel,
         )
 
     if is_tf_available():
-        from .modeling_tf_blenderbot import TFBlenderbotForConditionalGeneration, TFBlenderbotModel
+        from .modeling_tf_blenderbot_small import TFBlenderbotSmallForConditionalGeneration, TFBlenderbotSmallModel
 
 else:
     import importlib
