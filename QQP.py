@@ -14,7 +14,6 @@ from PIL import Image
 import sys
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import pandas as pd
 import logging
 import os
@@ -108,7 +107,8 @@ class Allen(Dataset):
               
         input_ids = encoded['input_ids']
         attn_mask = encoded['attention_mask']
-        return input_ids.view(350), attn_mask.view(350), torch.tensor(label, dtype=torch.long)
+        token_type_ids = encoded['token_type_ids']
+        return input_ids.view(350), attn_mask.view(350), token_type_ids.view(350), torch.tensor(label, dtype=torch.long)
 
     def __len__(self):
 
@@ -120,7 +120,7 @@ train_dataset = Allen('train')
 val_dataset = Allen('val')
 test_dataset = Allen('test')
 
-train_dataloader = DataLoader(train_dataset,batch_size=16,shuffle=True)
+train_dataloader = DataLoader(train_dataset,batch_size=32,shuffle=True)
 val_dataloader = DataLoader(val_dataset,batch_size=32)
 test_dataloader = DataLoader(test_dataset,batch_size=32)
 
@@ -131,27 +131,32 @@ class Model(nn.Module):
     def __init__(self, backbond):
         super(Model, self).__init__()
         self.backbond = backbond
-        self.condition = "train"
         self.weight_lst= []
         self.param_lst = []
-        #self.backbond.named_parameters()
+
         for name,param in self.backbond.named_parameters(): 
-            #print(param)
             if 'LayerNorm' in name and 'attention' not in name:
                 self.param_lst.append(param)
                 continue
             elif 'adapter' in name:
-                self.param_lst.append(param)
+                if 'bias' in name:
+                    self.param_lst.append(param)
+                else:
+                    self.weight_lst.append(param)
                 continue
             else:
                 param.requires_grad = False
 
         self.fc = nn.Sequential(
+            nn.Dropout(),
             nn.Linear(768,2),
         )
-    def forward(self, tokens, mask, condition):
-        self.condition = condition
-        embedding = self.backbond(input_ids=tokens, attention_mask=mask)[1]
+
+        for name,param in self.fc.named_parameters(): 
+            self.weight_lst.append(param)
+
+    def forward(self, tokens, mask, type_id):
+        embedding = self.backbond(input_ids=tokens, attention_mask=mask, token_type_ids = type_id)[1]
         answer = self.fc(embedding)
         return answer
 
@@ -163,13 +168,7 @@ def plotImage(G_losses, path):
     plt.plot(G_losses)
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
-    #plt.legend()
     plt.savefig(path)
-def showweight(arr):
-    print('Model alpha List')
-    for i in range(int(len(arr)/2)):
-        count = i * 2
-        print('serial alpha = ', arr[count].item(), ' parallel alpha = ', arr[count+1].item())
 
 
 # +
@@ -177,7 +176,10 @@ backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
 model = Model(backbond).to(device)
 loss_funtion = nn.CrossEntropyLoss()
 lr = 0.0001
-optimizer = optim.AdamW(model.parameters(), lr = lr)
+
+optimizer_weight = optim.AdamW(model.weight_lst, lr = lr)
+optimizer_bias = optim.AdamW(model.param_lst, lr = lr, weight_decay=0)
+
 path = sys.argv[1]
 model_path = os.path.join(path, 'QQP.ckpt')
 pic_path = os.path.join(path, 'QQP.png')
@@ -197,15 +199,17 @@ for epoch in range(20):
     my_ans = []
     real_ans = []
     for batch_id, data in enumerate(tqdm(train_dataloader)):
-        condition = "train"
-        tokens, mask, label = data
-        tokens, mask, label = tokens.to(device),mask.to(device), label.to(device)
-        output = model(tokens = tokens, mask = mask, condition = condition)
+
+        tokens, mask, type_id, label = data
+        tokens, mask, type_id, label = tokens.to(device),mask.to(device), type_id.to(device), label.to(device)
+        output = model(tokens = tokens, mask = mask, type_id = type_id)
 
         loss = loss_funtion(output, label)
-        optimizer.zero_grad()
+        optimizer_weight.zero_grad()
+        optimizer_bias.zero_grad()
         loss.backward()
-        optimizer.step()
+        optimizer_weight.step()
+        optimizer_bias.step()
         output = output.view(-1,2)
         pred = torch.max(output, 1)[1]
         for j in range(len(pred)):
@@ -226,9 +230,9 @@ for epoch in range(20):
         my_ans = []
         real_ans = []
         for batch_id, data in enumerate(tqdm(val_dataloader)):
-            tokens, mask, label = data
-            tokens, mask, label = tokens.to(device),mask.to(device), label.to(device)
-            output = model(tokens=tokens, mask=mask,condition="test")
+            tokens, mask, type_id, label = data
+            tokens, mask, type_id, label = tokens.to(device),mask.to(device), type_id.to(device), label.to(device)
+            output = model(tokens = tokens, mask = mask, type_id = type_id)
             output = output.view(-1,2)
             pred = torch.max(output, 1)[1]
             for j in range(len(pred)):
@@ -242,24 +246,23 @@ for epoch in range(20):
     f1 = f1_score(real_ans, my_ans)
     accuracy.append(score)
     if score >= best_acc:
-        #print(model.weight_lst)
         best_acc = score
         best_f1 = f1
         best_epoch = epoch
         torch.save(model.state_dict(), model_path)
     end = time.time()
-    #print('model_weight = ', model.weight_lst)
+
     print('epoch = ', epoch + 1)
-    #print('eval_acc = ', score,', eval_f1 = ', f1, ", train score:", train_score)
-    #print('time = ', epoch_finish - epoch_start)
+    print('eval_acc = ', score, " train score:", train_acc)
     print('best epoch = ', best_epoch +1)
     print('best acc = ', best_acc)
     print('best f1 = ', best_f1)
     if epoch == 0:
         print('預計train時間 = ', 15*(end-epoch_start)/60, '分鐘')
     print('=====================================')
-plotImage(accuracy,pic_path)
+#plotImage(accuracy,pic_path)
 
+'''
 write_path = os.path.join(path, 'QQP.txt')
 f = open(write_path, 'w')
 f.write("Task = QQP\n")
@@ -270,14 +273,36 @@ f.write("Pick best epoch = " + str(best_epoch + 1) + '\n')
 f.write("Pick best accuracy = " + str(best_acc) + '\n')
 f.write("Pick best F1 = " + str(best_f1) + '\n')
 f.close()
+'''
 print('Done QQP!!!')
 
-'''
+# +
+backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
 model = Model(backbond).to(device)
-ckpt = torch.load(model_path + 'QQP.ckpt')
+
+print('Start predict QQP!!!')
+
+ckpt = torch.load(model_path)
 model.load_state_dict(ckpt)
 model.eval()
-if model_path == './alpha_one/':
-    print('QQP')
-    showweight(model.weight_lst)
-'''
+
+ans = []
+with torch.no_grad():
+    for batch_id, data in enumerate(tqdm(test_dataloader)):
+        tokens, mask, type_id, _ = data
+        tokens, mask, type_id = tokens.to(device),mask.to(device), type_id.to(device)
+        output = model(tokens = tokens, mask = mask, type_id = type_id)
+        output = output.view(-1,2)
+        pred = torch.max(output, 1)[1]
+        for i in range(len(pred)):
+            ans.append(int(pred[i]))
+
+output_path = sys.argv[1]
+output_file = os.path.join(output_path, 'QQP.tsv')
+            
+with open(output_file, 'wt') as out_file:
+    tsv_writer = csv.writer(out_file, delimiter='\t')
+    tsv_writer.writerow(['Id', 'Label'])
+    for idx, label in enumerate(ans):
+        tsv_writer.writerow([idx, label])
+

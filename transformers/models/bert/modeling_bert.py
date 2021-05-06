@@ -15,7 +15,7 @@
 # limitations under the License.
 """PyTorch BERT model. """
 
-
+import sys
 import math
 import os
 import warnings
@@ -419,29 +419,30 @@ class BertAdapter(nn.Module):
         self.bottle = bottleneck
         self.condition = condition
         
-        if 'alpha_one' in sys.argv[1]:
-            #print('目前架構 ： alpha_one !!!')
+        if 'one' in sys.argv[1]:
+            print('目前架構 ： Alpha_one !!!')
             self.alpha = nn.Parameter(torch.ones(1, requires_grad=True))
-        elif 'alpha_linear_output' in sys.argv[1]:
-            #print('目前架構 ： alpha_linear_output !!!')
+        elif 'linear_output' in sys.argv[1]:
+            print('目前架構 ： Alpha_linear_output !!!')
             self.alpha = nn.Linear(config.hidden_size, 1)
-        elif 'alpha_linear_input' in sys.argv[1]:
-            #print('目前架構 ： alpha_linear_input !!!')
+        elif 'linear_input' in sys.argv[1]:
+            print('目前架構 ： Alpha_linear_input !!!')
             self.alpha = nn.Linear(self.inputdim, 1)
-        
+        else:
+            print('目前架構 ： Mixed !!!')
         self.model = nn.Sequential(
             nn.Linear(self.inputdim, self.bottle),
             nn.GELU(),
             nn.Linear(self.bottle, config.hidden_size),
         )
     def forward(self, x):
-        if 'alpha_one' in sys.argv[1]:
+        if 'one' in sys.argv[1]:
             x = self.alpha * self.model(x)
-        elif 'alpha_linear_output' in sys.argv[1]:
+        elif 'linear_output' in sys.argv[1]:
             x = self.model(x)
             y = self.alpha(x)
             x = y * x
-        elif 'alpha_linear_input' in sys.argv[1]:
+        elif 'linear_input' in sys.argv[1]:
             y = self.alpha(x)
             x = self.model(x)
             x = y * x
@@ -458,7 +459,7 @@ class BertOutput(nn.Module):
         ##自己改的
         self.condition = condition
         if 'vector' in sys.argv[1]:
-            print('目前架構 ： vector_linear !!!')
+            print('目前架構 ： Vector_linear !!!')
             self.adapter_vector = nn.Parameter(torch.ones((768), requires_grad=True))
             self.adapter_alpha = nn.Linear(config.intermediate_size, 1)
         else:

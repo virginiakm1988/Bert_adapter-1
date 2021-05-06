@@ -14,7 +14,6 @@ from PIL import Image
 import sys
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import pandas as pd
 import logging
 import os
@@ -46,15 +45,20 @@ def ensure_dir(file_path):
         os.makedirs(directory)
 data_dir = sys.argv[3]
 # +
-train_path = os.path.join(data_dir,'MRPC/train.csv')
-df_train = pd.read_csv(train_path)
-df_train.columns = ['label','sen1','sen2']
+train_path = os.path.join(data_dir,'MRPC/train.tsv')
+df_train = pd.read_csv(train_path, sep='\t',error_bad_lines=False)
+df_train.columns = ['label','ID1','ID2','sen1','sen2']
+df_train.dropna()
 
+val_path = os.path.join(data_dir,'MRPC/dev.tsv')
+df_val = pd.read_csv(val_path, sep='\t',error_bad_lines=False)
+df_val.columns = ['label','ID1','ID2','sen1','sen2']
+df_val.dropna()
 
-val_path = os.path.join(data_dir,'MRPC/test.csv')
-df_val = pd.read_csv(val_path)
-df_val.columns = ['label','sen1','sen2']
-
+test_path = os.path.join(data_dir,'MRPC/test.tsv')
+df_test = pd.read_csv(test_path, sep='\t',error_bad_lines=False)
+df_test.columns = ['id', 'ID1', 'ID2', 'sen1', 'sen2']
+df_test.dropna()
 
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
@@ -66,9 +70,10 @@ class Allen(Dataset):
         self.mode = mode
         if self.mode == 'train':
             self.len = len(df_train)
-        else:
+        elif self.mode == 'val':
             self.len = len(df_val)
-
+        else:
+            self.len = len(df_test)
     def __getitem__(self, index):
         if self.mode == 'train':
             encoded = tokenizer.encode_plus(
@@ -81,7 +86,7 @@ class Allen(Dataset):
                 return_tensors = 'pt',  # ask the function to return PyTorch tensors
             )
             label = df_train['label'][index]
-        else:
+        elif self.mode == 'val':
             encoded = tokenizer.encode_plus(
                 df_val['sen1'][index],  # the sentence to be encoded
                 df_val['sen2'][index],
@@ -92,10 +97,22 @@ class Allen(Dataset):
                 return_tensors = 'pt',  # ask the function to return PyTorch tensors
             )
             label = df_val['label'][index]    
+        else:
+            encoded = tokenizer.encode_plus(
+                df_test['sen1'][index],  # the sentence to be encoded
+                df_test['sen2'][index],
+                add_special_tokens=True,  # Add [CLS] and [SEP]
+                max_length = 128,  # maximum length of a sentence
+                padding='max_length',  # Add [PAD]s
+                return_attention_mask = True,  # Generate the attention mask
+                return_tensors = 'pt',  # ask the function to return PyTorch tensors
+            )
+            label = 0
               
         input_ids = encoded['input_ids']
         attn_mask = encoded['attention_mask']
-        return input_ids.view(128), attn_mask.view(128), torch.tensor(label, dtype=torch.long)
+        token_type_ids = encoded['token_type_ids']
+        return input_ids.view(128), attn_mask.view(128), token_type_ids.view(128), torch.tensor(label, dtype=torch.long)
 
     def __len__(self):
 
@@ -103,38 +120,46 @@ class Allen(Dataset):
 
 train_dataset = Allen('train')
 val_dataset = Allen('val')
-train_dataloader = DataLoader(train_dataset,batch_size=64, num_workers = 20, shuffle=True)
-val_dataloader = DataLoader(val_dataset,batch_size=64, num_workers = 20)
+test_dataset = Allen('test')
+
+train_dataloader = DataLoader(train_dataset,batch_size=32, shuffle=True)
+val_dataloader = DataLoader(val_dataset,batch_size=64)
+test_dataloader = DataLoader(test_dataset,batch_size=64)
 
 
 class Model(nn.Module):
     def __init__(self, backbond):
         super(Model, self).__init__()
         self.backbond = backbond
-        self.condition = "train"
         self.weight_lst= []
         self.param_lst = []
-        #self.backbond.named_parameters()
+
         for name,param in self.backbond.named_parameters(): 
             if 'LayerNorm' in name and 'attention' not in name:
                 self.param_lst.append(param)
                 continue
-            #elif 'adapter' in name:
-            elif "alpha"in name:
-                self.param_lst.append(param)
             elif 'adapter' in name:
-                self.param_lst.append(param)
+                if 'bias' in name:
+                    self.param_lst.append(param)
+                else:
+                    self.weight_lst.append(param)
                 continue
             else:
                 param.requires_grad = False
+
         self.fc = nn.Sequential(
+            nn.Dropout(),
             nn.Linear(768,2),
         )
-    def forward(self, tokens, mask, condition):
-        self.condition = condition
-        embedding = self.backbond(input_ids=tokens, attention_mask=mask)[1]
+
+        for name,param in self.fc.named_parameters(): 
+            self.weight_lst.append(param)
+
+    def forward(self, tokens, mask, type_id):
+        embedding = self.backbond(input_ids=tokens, attention_mask=mask, token_type_ids = type_id)[1]
         answer = self.fc(embedding)
         return answer
+
 def plotImage(G_losses, path):
     print('Start to plot!!')
     plt.figure(figsize=(10, 5))
@@ -143,11 +168,7 @@ def plotImage(G_losses, path):
     plt.xlabel("Epoch")
     plt.ylabel("F1")
     plt.savefig(path)
-def showweight(arr):
-    print('Model alpha List')
-    for i in range(int(len(arr)/2)):
-        count = i * 2
-        print('serial alpha = ', arr[count].item(), ' parallel alpha = ', arr[count+1].item())
+
 
 
 # -
@@ -156,11 +177,11 @@ backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
 model = Model(backbond).to(device)
 loss_funtion = nn.CrossEntropyLoss()
 lr = 0.0001
-optimizer = optim.AdamW(model.parameters(), lr = lr)
+
+optimizer_weight = optim.AdamW(model.weight_lst, lr = lr)
+optimizer_bias = optim.AdamW(model.param_lst, lr = lr, weight_decay=0)
 
 
-from tqdm import tqdm
-from time import sleep
 
 # +
 path = sys.argv[1]
@@ -182,15 +203,17 @@ for epoch in range(100): #100
     my_ans = []
     real_ans = []
     for batch_id, data in enumerate(tqdm(train_dataloader)):
-        condition = "train"
-        tokens, mask, label = data
-        tokens, mask, label = tokens.to(device),mask.to(device), label.to(device)
-        output = model(tokens = tokens, mask = mask, condition = condition)
+
+        tokens, mask, type_id, label = data
+        tokens, mask, type_id, label = tokens.to(device),mask.to(device), type_id.to(device), label.to(device)
+        output = model(tokens = tokens, mask = mask, type_id = type_id)
 
         loss = loss_funtion(output, label)
-        optimizer.zero_grad()
+        optimizer_weight.zero_grad()
+        optimizer_bias.zero_grad()
         loss.backward()
-        optimizer.step()
+        optimizer_weight.step()
+        optimizer_bias.step()
         output = output.view(-1,2)
         pred = torch.max(output, 1)[1]
         for j in range(len(pred)):
@@ -213,9 +236,9 @@ for epoch in range(100): #100
         my_ans = []
         real_ans = []
         for batch_id, data in enumerate(tqdm(val_dataloader)):
-            tokens, mask, label = data
-            tokens, mask, label = tokens.to(device),mask.to(device), label.to(device)
-            output = model(tokens=tokens, mask=mask,condition="test")
+            tokens, mask, type_id, label = data
+            tokens, mask, type_id, label = tokens.to(device),mask.to(device), type_id.to(device), label.to(device)
+            output = model(tokens = tokens, mask = mask, type_id = type_id)
             output = output.view(-1,2)
             pred = torch.max(output, 1)[1]
             for j in range(len(pred)):
@@ -229,11 +252,10 @@ for epoch in range(100): #100
     f1 = f1_score(real_ans, my_ans)
     accuracy.append(f1)
     if f1 >= best_f1:
-        #rint(model.weight_lst)
         best_acc = score
         best_f1 = f1
         best_epoch = epoch
-        torch.save(model.state_dict(), model_path)
+        torch.save(model.state_dict(), 'MRPC.ckpt')
     end = time.time()
     #print('model_weight = ', model.weight_lst)
     print('epoch = ', epoch)
@@ -245,8 +267,9 @@ for epoch in range(100): #100
     if epoch == 0:
         print('預計train時間 = ', 100*(end-epoch_start)/60, '分鐘')
     print('=====================================')
-plotImage(accuracy,pic_path)
+#plotImage(accuracy,pic_path)
 
+'''
 write_path = os.path.join(path, 'MRPC.txt')
 f = open(write_path, 'w')
 f.write("Task = MRPC\n")
@@ -257,15 +280,38 @@ f.write("Pick best epoch = " + str(best_epoch + 1) + '\n')
 f.write("Pick best accuracy = " + str(best_acc) + '\n')
 f.write("Pick best F1 = " + str(best_f1) + '\n')
 f.close()
+'''
 
 print('Done MRPC!!!')
 
-'''
+# +
+backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
 model = Model(backbond).to(device)
-ckpt = torch.load(model_path + 'MRPC.ckpt')
+
+print('Start predict MRPC!!!')
+
+ckpt = torch.load('MRPC.ckpt')
 model.load_state_dict(ckpt)
 model.eval()
-if model_path == './alpha_one/':
-    print('MRPC')
-    showweight(model.weight_lst)
-'''
+
+ans = []
+with torch.no_grad():
+    for batch_id, data in enumerate(tqdm(test_dataloader)):
+        tokens, mask, type_id, _ = data
+        tokens, mask, type_id = tokens.to(device),mask.to(device), type_id.to(device)
+        output = model(tokens = tokens, mask = mask, type_id = type_id)
+        output = output.view(-1,2)
+        pred = torch.max(output, 1)[1]
+        for i in range(len(pred)):
+            ans.append(int(pred[i]))
+            
+output_path = sys.argv[1]
+output_path = 'gdrive/My Drive/bert'
+output_file = os.path.join(output_path, 'MRPC.tsv')
+            
+with open(output_file, 'wt') as out_file:
+    tsv_writer = csv.writer(out_file, delimiter='\t')
+    tsv_writer.writerow(['Id', 'Label'])
+    for idx, label in enumerate(ans):
+        tsv_writer.writerow([idx, label])
+

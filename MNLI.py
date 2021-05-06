@@ -14,7 +14,6 @@ from PIL import Image
 import sys
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import pandas as pd
 import logging
 import os
@@ -66,7 +65,6 @@ df_test_match = pd.read_csv(test_match_path, sep='\t',error_bad_lines=False, kee
 
 test_mismatch_path = os.path.join(data_dir,'MNLI/test_mismatched.tsv')
 df_test_mismatch = pd.read_csv(test_mismatch_path, sep='\t',error_bad_lines=False, keep_default_na = False)
-
 
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
@@ -158,9 +156,11 @@ class Allen(Dataset):
                 return_tensors = 'pt',  # ask the function to return PyTorch tensors
             )
             label = 0
+
         input_ids = encoded['input_ids'][0][:128]
         attn_mask = encoded['attention_mask'][0][:128]
-        return input_ids.view(128), attn_mask.view(128), torch.tensor(label, dtype=torch.long)
+        token_type_ids = encoded['token_type_ids'][0][:128]
+        return input_ids.view(128), attn_mask.view(128), token_type_ids.view(128), torch.tensor(label, dtype=torch.long)
 
     def __len__(self):
 
@@ -173,11 +173,11 @@ test_m_dataset = Allen('test_m')
 test_mm_dataset = Allen('test_mm')
 
 
-train_dataloader = DataLoader(train_dataset,batch_size=64,shuffle=True)
+train_dataloader = DataLoader(train_dataset,batch_size=32,shuffle=True)
 
-val_m_dataloader = DataLoader(val_m_dataset,batch_size=64)
-val_mm_dataloader = DataLoader(val_mm_dataset,batch_size=64)
-test_m_dataloader = DataLoader(test_m_dataset,batch_size=32)
+val_m_dataloader = DataLoader(val_m_dataset,batch_size=16)
+val_mm_dataloader = DataLoader(val_mm_dataset,batch_size=16)
+test_m_dataloader = DataLoader(test_m_dataset,batch_size=16)
 test_mm_dataloader = DataLoader(test_mm_dataset,batch_size=32)
 
 
@@ -187,29 +187,35 @@ class Model(nn.Module):
     def __init__(self, backbond):
         super(Model, self).__init__()
         self.backbond = backbond
-        self.condition = "train"
         self.weight_lst= []
         self.param_lst = []
-        #self.backbond.named_parameters()
+
         for name,param in self.backbond.named_parameters(): 
-            #print(param)
             if 'LayerNorm' in name and 'attention' not in name:
                 self.param_lst.append(param)
                 continue
             elif 'adapter' in name:
-                self.param_lst.append(param)
+                if 'bias' in name:
+                    self.param_lst.append(param)
+                else:
+                    self.weight_lst.append(param)
                 continue
             else:
                 param.requires_grad = False
 
         self.fc = nn.Sequential(
+            nn.Dropout(),
             nn.Linear(768,3),
         )
-    def forward(self, tokens, mask, condition):
-        self.condition = condition
-        embedding = self.backbond(input_ids=tokens, attention_mask=mask)[1]
+
+        for name,param in self.fc.named_parameters(): 
+            self.weight_lst.append(param)
+
+    def forward(self, tokens, mask, type_id):
+        embedding = self.backbond(input_ids=tokens, attention_mask=mask, token_type_ids = type_id)[1]
         answer = self.fc(embedding)
         return answer
+
 
 
 # +
@@ -226,19 +232,16 @@ def plotImage(G_losses, path, match):
     else:
         plt.savefig(os.path.join(path, 'MNLI_mm.png'))
 
-def showweight(arr):
-    print('Model alpha List')
-    for i in range(int(len(arr)/2)):
-        count = i * 2
-        print('serial alpha = ', arr[count].item(), ' parallel alpha = ', arr[count+1].item())
-
 
 # +
 backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
 model = Model(backbond).to(device)
 loss_funtion = nn.CrossEntropyLoss()
 lr = 0.0001
-optimizer = optim.AdamW(model.parameters(), lr = lr)
+
+optimizer_weight = optim.AdamW(model.weight_lst, lr = lr)
+optimizer_bias = optim.AdamW(model.param_lst, lr = lr, weight_decay=0)
+
 path = sys.argv[1]
 model_m_path = os.path.join(path, 'MNLI_m.ckpt')
 model_mm_path = os.path.join(path, 'MNLI_mm.ckpt')
@@ -258,15 +261,17 @@ for epoch in range(30):
     my_ans = []
     real_ans = []
     for batch_id, data in enumerate(tqdm(train_dataloader)):
-        condition = "train"
-        tokens, mask, label = data
-        tokens, mask, label = tokens.to(device),mask.to(device), label.to(device)
-        output = model(tokens = tokens, mask = mask, condition = condition)
+        
+        tokens, mask, type_id, label = data
+        tokens, mask, type_id, label = tokens.to(device),mask.to(device), type_id.to(device), label.to(device)
+        output = model(tokens = tokens, mask = mask, type_id = type_id)
 
         loss = loss_funtion(output, label)
-        optimizer.zero_grad()
+        optimizer_weight.zero_grad()
+        optimizer_bias.zero_grad()
         loss.backward()
-        optimizer.step()
+        optimizer_weight.step()
+        optimizer_bias.step()
         output = output.view(-1,3)
         pred = torch.max(output, 1)[1]
         for j in range(len(pred)):
@@ -284,9 +289,9 @@ for epoch in range(30):
         correct_mm = 0
         count_mm = 0 
         for batch_id, data in enumerate(tqdm(val_m_dataloader)):
-            tokens, mask, label = data
-            tokens, mask, label = tokens.to(device),mask.to(device), label.to(device)
-            output = model(tokens=tokens, mask=mask,condition="test")
+            tokens, mask, type_id, label = data
+            tokens, mask, type_id, label = tokens.to(device),mask.to(device), type_id.to(device), label.to(device)
+            output = model(tokens = tokens, mask = mask, type_id = type_id)
             output = output.view(-1,3)
             pred = torch.max(output, 1)[1]
             for j in range(len(pred)):
@@ -294,9 +299,9 @@ for epoch in range(30):
                     correct_m+=1
                 count_m+=1
         for batch_id, data in enumerate(tqdm(val_mm_dataloader)):
-            tokens, mask, label = data
-            tokens, mask, label = tokens.to(device),mask.to(device), label.to(device)
-            output = model(tokens=tokens, mask=mask,condition="test")
+            tokens, mask, type_id, label = data
+            tokens, mask, type_id, label = tokens.to(device),mask.to(device), type_id.to(device), label.to(device)
+            output = model(tokens = tokens, mask = mask, type_id = type_id)
             output = output.view(-1,3)
             pred = torch.max(output, 1)[1]
             for j in range(len(pred)):
@@ -309,12 +314,10 @@ for epoch in range(30):
     accuracy_m.append(score_m)
     accuracy_mm.append(score_mm)
     if score_m >= best_acc_m:
-        #rint(model.weight_lst)
         best_acc_m = score_m
         best_epoch_m = epoch + 1
         torch.save(model.state_dict(), model_m_path)
     if score_mm >= best_acc_mm:
-        #rint(model.weight_lst)
         best_acc_mm = score_mm
         best_epoch_mm = epoch + 1
         torch.save(model.state_dict(), model_mm_path)
@@ -328,9 +331,10 @@ for epoch in range(30):
     if epoch == 0:
         print('預計train時間 = ', 30*(end-epoch_start)/60, '分鐘')
     print('=====================================')
-plotImage(accuracy_m,path,'m')
-plotImage(accuracy_mm,path,'mm')
+#plotImage(accuracy_m,path,'m')
+#plotImage(accuracy_mm,path,'mm')
 
+'''
 write_path = os.path.join(path, 'MNLI.txt')
 f = open(write_path, 'w')
 f.write("Task = MNLI-m\n")
@@ -343,23 +347,74 @@ f.write("Total epoch = " + str(epoch + 1) + '\n')
 f.write("Pick best epoch = " + str(best_epoch_mm + 1) + '\n')
 f.write("Pick best accuracy = " + str(best_acc_mm) + '\n')
 f.close()
+'''
 
 print('Done MNLI!!!')
 
-'''
-model = Model(backbond).to(device)
-ckpt = torch.load(model_path + 'MNLI_m.ckpt')
-model.load_state_dict(ckpt)
-model.eval()
-if model_path == './alpha_one/':
-    print('MNLI_m')
-    showweight(model.weight_lst)
+backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
+
+print('Start predict MNLI!!!')
 
 model = Model(backbond).to(device)
-ckpt = torch.load(model_path + 'MNLI_mm.ckpt')
+ckpt = torch.load(os.path.join(path, 'MNLI_m.ckpt'))
+model.load_state_dict(ckpt)
+
+model.eval()
+ans = []
+with torch.no_grad():
+    for batch_id, data in enumerate(tqdm(test_m_dataloader)):
+        tokens, mask, type_id, _ = data
+        tokens, mask, type_id = tokens.to(device),mask.to(device), type_id.to(device)
+        output = model(tokens = tokens, mask = mask, type_id = type_id)
+        output = output.view(-1,3)
+        pred = torch.max(output, 1)[1]
+        for i in range(len(pred)):
+            ans.append(int(pred[i]))
+            
+output_path = sys.argv[3]
+output_path = 'gdrive/My Drive/bert'
+output_file = os.path.join(output_path, 'MNLI-m.tsv')
+            
+with open(output_file, 'wt') as out_file:
+    tsv_writer = csv.writer(out_file, delimiter='\t')
+    tsv_writer.writerow(['Id', 'Label'])
+    for idx, label in enumerate(ans):
+        if label == 0:
+            tsv_writer.writerow([idx, 'contradiction'])
+        if label == 1:
+            tsv_writer.writerow([idx, 'neutral'])
+        else:
+            tsv_writer.writerow([idx, 'entailment'])
+
+
+model = Model(backbond).to(device)
+ckpt = torch.load(os.path.join(path, 'MNLI_mm.ckpt'))
 model.load_state_dict(ckpt)
 model.eval()
-if model_path == './alpha_one/':
-    print('MNLI_mm')
-    showweight(model.weight_lst)
-'''
+ans = []
+
+with torch.no_grad():
+    for batch_id, data in enumerate(tqdm(test_mm_dataloader)):
+        tokens, mask, type_id, _ = data
+        tokens, mask, type_id = tokens.to(device),mask.to(device), type_id.to(device)
+        output = model(tokens = tokens, mask = mask, type_id = type_id)
+        output = output.view(-1,3)
+        pred = torch.max(output, 1)[1]
+        for i in range(len(pred)):
+            ans.append(int(pred[i]))
+            
+output_path = sys.argv[1]
+
+output_file = os.path.join(output_path, 'MNLI-mm.tsv')
+            
+with open(output_file, 'wt') as out_file:
+    tsv_writer = csv.writer(out_file, delimiter='\t')
+    tsv_writer.writerow(['Id', 'Label'])
+    for idx, label in enumerate(ans):
+        if label == 0:
+            tsv_writer.writerow([idx, 'contradiction'])
+        if label == 1:
+            tsv_writer.writerow([idx, 'neutral'])
+        else:
+            tsv_writer.writerow([idx, 'entailment'])
+
