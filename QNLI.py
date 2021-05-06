@@ -24,6 +24,7 @@ from tqdm import tqdm
 from time import sleep
 import numpy as np
 import time
+import csv
 import sys
 import matplotlib.pyplot as plt
 from transformers import BertTokenizer, BertModel

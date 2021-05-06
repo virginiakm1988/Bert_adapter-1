@@ -25,6 +25,7 @@ from time import sleep
 import numpy as np
 import time
 import sys
+import csv
 import matplotlib.pyplot as plt
 from transformers import BertTokenizer, BertModel
 from sklearn.metrics import f1_score
@@ -187,7 +188,7 @@ print('Start training SST-2!!!')
 best_acc = 0
 best_epoch=0
 accuracy = []
-for epoch in range(50):
+for epoch in range(25):
     epoch_start = time.time()
     
     #training
@@ -243,7 +244,7 @@ for epoch in range(50):
     print('best epoch = ', best_epoch+1)
     print('best acc = ', best_acc)
     if epoch == 0:
-        print('預計train時間 = ', 50*(end-epoch_start)/60, '分鐘')
+        print('預計train時間 = ', 25*(end-epoch_start)/60, '分鐘')
     print('=====================================')
 #plotImage(accuracy,pic_path)
 

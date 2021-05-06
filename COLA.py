@@ -14,7 +14,6 @@ from PIL import Image
 import sys
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import pandas as pd
 import logging
 import os
