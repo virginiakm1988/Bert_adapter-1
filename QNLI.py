@@ -149,6 +149,9 @@ class Model(nn.Module):
             elif 'adapter' in name:
                 if 'bias' in name:
                     self.param_lst.append(param)
+                elif 'fix' in sys.argv[1] and 'vector' in name:
+                    print('大哥好，您把vector fix住了哦！！！')
+                    param.requires_grad = False                    
                 else:
                     self.weight_lst.append(param)
                 continue

@@ -141,6 +141,9 @@ class Model(nn.Module):
             elif 'adapter' in name:
                 if 'bias' in name:
                     self.param_lst.append(param)
+                elif 'fix' in sys.argv[1] and 'vector' in name:
+                    print('大哥好，您把vector fix住了哦！！！')
+                    param.requires_grad = False                    
                 else:
                     self.weight_lst.append(param)
                 continue
@@ -307,7 +310,7 @@ with torch.no_grad():
             
 output_path = sys.argv[1]
 output_path = 'gdrive/My Drive/bert'
-output_file = os.path.join(output_path, 'MRPC.tsv')
+output_file = os.path.join(output_path, path, 'MRPC.tsv')
             
 with open(output_file, 'wt') as out_file:
     tsv_writer = csv.writer(out_file, delimiter='\t')
