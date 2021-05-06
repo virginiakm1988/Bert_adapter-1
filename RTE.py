@@ -281,7 +281,7 @@ with torch.no_grad():
     for batch_id, data in enumerate(tqdm(test_dataloader)):
         tokens, mask, type_id, _ = data
         tokens, mask, type_id = tokens.to(device),mask.to(device), type_id.to(device)
-        output = model(tokens = tokens, mask = mask, type_id = type_id, condition = 'test')
+        output = model(tokens = tokens, mask = mask, type_id = type_id)
         output = output.view(-1,2)
         pred = torch.max(output, 1)[1]
         for i in range(len(pred)):
