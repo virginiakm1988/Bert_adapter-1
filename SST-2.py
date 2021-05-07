@@ -68,7 +68,7 @@ class Allen(Dataset):
         elif self.mode == 'val':
             self.len = len(df_val)
         else:
-            self.mode = len(df_test)
+            self.len = len(df_test)
 
     def __getitem__(self, index):
         if self.mode == 'train':

@@ -263,11 +263,6 @@ f.close()
 print('Done RTE!!!')
 
 
-test_path = 'RTE/test_new.tsv'
-df_test = pd.read_csv(test_path, sep='\t')
-df_test.columns = ['id', 'sen1', 'sen2']
-
-
 
 # +
 backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
