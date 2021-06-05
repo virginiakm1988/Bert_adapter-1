@@ -451,7 +451,7 @@ class BertAdapter(nn.Module):
         return x
     
 class BertOutput(nn.Module):
-    def __init__(self, config, condition):
+    def __init__(self, config, condition, xi):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -461,7 +461,8 @@ class BertOutput(nn.Module):
         if 'vector' in sys.argv[1]:
             print('目前架構 ： Vector_linear !!!')
             self.adapter_vector = nn.Parameter(torch.ones((768), requires_grad=True))
-            self.adapter_alpha = nn.Linear(config.intermediate_size, 1)
+            #self.adapter_alpha = nn.Linear(config.intermediate_size, 1) #每個layer的xi都不一樣
+            self.adapter_alpha = xi
         else:
             self.adapter_serial = BertAdapter(config, config.hidden_size, int(sys.argv[2]), 'serial')
             self.adapter_parallel = BertAdapter(config, config.intermediate_size, int(sys.argv[2]), 'parallel')
@@ -511,7 +512,7 @@ class BertOutput(nn.Module):
         return hidden_states
 
 class BertLayer(nn.Module):
-    def __init__(self, config, condition):
+    def __init__(self, config, condition, xi):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
@@ -523,7 +524,7 @@ class BertLayer(nn.Module):
             self.crossattention = BertAttention(config)
         self.intermediate = BertIntermediate(config)
         self.condition = condition
-        self.output = BertOutput(config, condition)
+        self.output = BertOutput(config, condition, xi)
 
     def forward(
         self,
@@ -599,26 +600,14 @@ class BertEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        # self.layer = nn.ModuleList([BertLayer(config, 'serial') for _ in range(int(config.num_hidden_layers)/2)])
-        # self.layer.extend([BertLayer(config, 'parallel') for _ in range(int(config.num_hidden_layers)/2)])
-        
-        #這邊要看清楚！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！
-        #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-        #並聯在前面的
-        #self.layer = nn.ModuleList([BertLayer(config, 'parallel') for _ in range(12)])
-        #self.layer.extend([BertLayer(config, 'serial') for _ in range(0)])
-        
-        #串連在前面的 -r
-        #self.layer = nn.ModuleList([BertLayer(config, 'serial') for _ in range(12)])
-        #self.layer.extend([BertLayer(config, 'parallel') for _ in range(0)])
 
         #learable
+        self.adapter_alpha = nn.Linear(config.intermediate_size, 1) #每個layer的xi都不一樣
         print("hello I'm here")
         if 'serial' in sys.argv[1]:
-            self.layer = nn.ModuleList([BertLayer(config, 'serial') for _ in range(12)])
-            #print('目前架構 : ', 'Serial !!!!!!!!!!')
+            self.layer = nn.ModuleList([BertLayer(config, 'serial', self.adapter_alpha) for _ in range(12)])
         else:
-            self.layer = nn.ModuleList([BertLayer(config, 'mixed') for _ in range(12)])
+            self.layer = nn.ModuleList([BertLayer(config, 'mixed', self.adapter_alpha) for _ in range(12)])
 
     def forward(
         self,
