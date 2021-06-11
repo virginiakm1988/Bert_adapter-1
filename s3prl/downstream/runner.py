@@ -7,6 +7,7 @@ import random
 import tempfile
 import importlib
 from pathlib import Path
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -14,15 +15,18 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import is_initialized, get_rank, get_world_size
+
 import hubconf
 from optimizers import get_optimizer
 from schedulers import get_scheduler
 from utility.helper import is_leader_process, count_parameters, get_model_state, show, defaultdict
-SAMPLE_RATE = 16000
 
-class Adapter_params():
-    def __init__(self,parameters):
-        self.parameters = parameters
+SAMPLE_RATE = 16000
+class Parameter_lst():
+        def __init__(self,param_lst):
+            self.parameter = param_lst
+        def parameters(self):
+            return self.parameter
 
 class Runner():
     """
@@ -139,6 +143,7 @@ class Runner():
         return scheduler
 
 
+
     def train(self):
         # set model train/eval modes
         self.downstream.train()
@@ -149,17 +154,20 @@ class Runner():
         model_params = [self.downstream]
         if self.args.adapter:
             self.upstream.train()
-            
+            param_lst = []
             for name, param in self.upstream.named_parameters():  # 带有参数名的模型的各个层包含的参数遍历
                 if 'LayerNorm' in name and 'attention' not in name:
                     # print(name,' 沒有被freeze')
+                    param_lst.append(param)
                     continue
                 elif 'adapter' in name:
+                    param_lst.append(param)
                     # print(name,' 沒有被freeze')
                     continue
                 else:
                     param.requires_grad = False
-            model_params.append(self.upstream)
+            
+            model_params.append(Parameter_lst(param_lst))
 
         # set optimizer
         
@@ -208,7 +216,7 @@ class Runner():
                     global_step = pbar.n + 1
 
                     wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
-                    if self.upstream.training or self.args.adapter:
+                    if self.upstream.training or self.adapters:
                         features = self.upstream(wavs)
                     else:
                         with torch.no_grad():

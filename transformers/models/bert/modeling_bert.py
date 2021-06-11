@@ -27,6 +27,9 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
 
+from ....modelconfig import get_args
+args= get_args()
+
 from ...activations import ACT2FN
 from ...file_utils import (
     ModelOutput,
@@ -419,56 +422,58 @@ class BertAdapter(nn.Module):
         self.bottle = bottleneck
         self.condition = condition
         
-        if 'one' in sys.argv[1]:
-            print('目前架構 ： Alpha_one !!!')
+        if 'alpha' in args.output_path:
+            print('目前架構 ： Alpha !!!')
             self.alpha = nn.Parameter(torch.ones(1, requires_grad=True))
-        elif 'linear_output' in sys.argv[1]:
-            print('目前架構 ： Alpha_linear_output !!!')
-            self.alpha = nn.Linear(config.hidden_size, 1)
-        elif 'linear_input' in sys.argv[1]:
-            print('目前架構 ： Alpha_linear_input !!!')
+        # elif 'linear_output' in args.output_path:
+        #     print('目前架構 ： Alpha_linear_output !!!')
+        #     self.alpha = nn.Linear(config.hidden_size, 1)
+        elif 'xi' in args.output_path:
+            print('目前架構 ： Xi !!!')
             self.alpha = nn.Linear(self.inputdim, 1)
         else:
-            print('目前架構 ： Mixed !!!')
+            print('目前架構 ： Error !!!')
         self.model = nn.Sequential(
             nn.Linear(self.inputdim, self.bottle),
             nn.GELU(),
             nn.Linear(self.bottle, config.hidden_size),
         )
     def forward(self, x):
-        if 'one' in sys.argv[1]:
+        if 'alpha' in args.output_path:
             x = self.alpha * self.model(x)
-        elif 'linear_output' in sys.argv[1]:
-            x = self.model(x)
+        # elif 'linear_output' in args.output_path:
+        #     x = self.model(x)
+        #     y = self.alpha(x)
+        #     x = y * x
+        elif 'xi' in args.output_path:
             y = self.alpha(x)
-            x = y * x
-        elif 'linear_input' in sys.argv[1]:
-            y = self.alpha(x)
             x = self.model(x)
             x = y * x
-        elif 'mixed' in sys.argv[1]:
+        elif 'mixed' in args.output_path:
             x = self.model(x)
         return x
     
 class BertOutput(nn.Module):
-    def __init__(self, config, condition, xi):
+    def __init__(self, config, condition, xi=None):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         ##自己改的
         self.condition = condition
-        if 'vector' in sys.argv[1]:
+        if 'vector' in args.output_path:
             print('目前架構 ： Vector_linear !!!')
             self.adapter_vector = nn.Parameter(torch.ones((768), requires_grad=True))
-            #self.adapter_alpha = nn.Linear(config.intermediate_size, 1) #每個layer的xi都不一樣
-            self.adapter_alpha = xi
+            if args.task_specific == 0:
+                self.adapter_alpha = nn.Linear(config.intermediate_size, 1) #每個layer的xi都不一樣
+            else:
+                self.adapter_alpha = xi
+                print('每層都一樣的xi哦 !!!')
         else:
-            self.adapter_serial = BertAdapter(config, config.hidden_size, int(sys.argv[2]), 'serial')
-            self.adapter_parallel = BertAdapter(config, config.intermediate_size, int(sys.argv[2]), 'parallel')
+            self.adapter_serial = BertAdapter(config, config.hidden_size, args.bottleneck, 'serial')
+            self.adapter_parallel = BertAdapter(config, config.intermediate_size, args.bottleneck, 'parallel')
 
     def forward(self, hidden_states, input_tensor):
-        #print('hi I am here')
         if self.condition == 'serial':
             hidden_states = self.dense(hidden_states)
             hidden_states = self.dropout(hidden_states)
@@ -481,18 +486,8 @@ class BertOutput(nn.Module):
             hidden_states = hidden_states + self.adapter_parallel(preserve)
             hidden_states = self.LayerNorm(hidden_states + input_tensor)
         elif self.condition == 'mixed':
-            if 'vector' in sys.argv[1]:
+            if 'vector' in args.output_path:
                 y = self.adapter_alpha(hidden_states)
-                ################印出txt################
-                '''
-                f = open('qqp_alpha.txt', 'a')
-                see = y.view(20)
-                total = ''
-                for i in range(20):
-                    total += str(see[i].item())[0:4] + ', '
-                print(total, file = f)
-                '''
-                ################印出txt################
                 hidden_states = self.dense(hidden_states)
                 hidden_states = self.dropout(hidden_states)
                 hidden_states = hidden_states + y * self.adapter_vector
@@ -505,14 +500,14 @@ class BertOutput(nn.Module):
                 control_parallel = self.adapter_parallel(source_1)
                 hidden_states = hidden_states + control_serial + control_parallel
                 hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        else:
+        else:#original
             hidden_states = self.dense(hidden_states)
             hidden_states = self.dropout(hidden_states)
             hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
 class BertLayer(nn.Module):
-    def __init__(self, config, condition, xi):
+    def __init__(self, config, condition, xi=None):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
@@ -602,12 +597,14 @@ class BertEncoder(nn.Module):
         self.config = config
 
         #learable
-        self.adapter_alpha = nn.Linear(config.intermediate_size, 1) #每個layer的xi都不一樣
-        print("hello I'm here")
-        if 'serial' in sys.argv[1]:
+        if 'serial' in args.output_path:
             self.layer = nn.ModuleList([BertLayer(config, 'serial', self.adapter_alpha) for _ in range(12)])
         else:
-            self.layer = nn.ModuleList([BertLayer(config, 'mixed', self.adapter_alpha) for _ in range(12)])
+            if args.task_specific == 1:
+                self.adapter_alpha = nn.Linear(config.intermediate_size, 1) #每個layer的xi都一樣
+                self.layer = nn.ModuleList([BertLayer(config, 'mixed', self.adapter_alpha) for _ in range(12)])
+            else:
+                self.layer = nn.ModuleList([BertLayer(config, 'mixed') for _ in range(12)])
 
     def forward(
         self,

@@ -24,35 +24,38 @@ from time import sleep
 import time
 import csv
 import matplotlib.pyplot as plt
-from transformers import BertTokenizer, BertModel
+from .transformers import BertTokenizer, BertModel
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 
+from .modelconfig import get_args
+args= get_args()
 
-use_cuda = torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
-random.seed(int(sys.argv[4]))
-np.random.seed(int(sys.argv[4]))
-torch.manual_seed(int(sys.argv[4]))
-torch.cuda.manual_seed(int(sys.argv[4]))
-torch.cuda.manual_seed_all(int(sys.argv[4]))
+SEED = args.seed
+data_dir = args.GLUE_path
+output_path = args.output_path
+model_path = os.path.join(output_path, 'model')
+pred_path = os.path.join(output_path, 'result')
+if not os.path.exists(model_path):
+    os.makedirs(model_path)
+if not os.path.exists(pred_path):
+    os.makedirs(pred_path)
+max_len = args.mnli_len
+batch_size = args.mnli_batch
+lr = args.mnli_lr
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 
 # +
-#MNLI ['index'0, 'promptID'1, 'pairID'2, 'genre'3, 'sentence1_binary_parse'4,
-#       'sentence2_binary_parse'5, 'sentence1_parse'6, 'sentence2_parse'7,
-#       'sentence1'8, 'sentence2'8, 'label1', 'gold_label']
-# 給定前提判斷假設是否成立
-
-
-data_dir = sys.argv[3]
-# +
-from transformers import BertTokenizer, BertModel
 train_path = os.path.join(data_dir,'MNLI/train.tsv')
 df_train = pd.read_csv(train_path, sep='\t',error_bad_lines=False, keep_default_na = False)
-
 
 val_match_path = os.path.join(data_dir,'MNLI/dev_matched.tsv')
 df_val_match = pd.read_csv(val_match_path, sep='\t',error_bad_lines=False, keep_default_na = False)
@@ -70,7 +73,6 @@ tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
 
 # +
-
 class Allen(Dataset): 
     def __init__(self, mode):
         self.mode = mode
@@ -91,7 +93,7 @@ class Allen(Dataset):
                 df_train['sentence1'][index],  # the sentence to be encoded
                 df_train['sentence2'][index],
                 add_special_tokens=True,  # Add [CLS] and [SEP]
-                max_length = 1000,  # maximum length of a sentence
+                max_length = max_len,  # maximum length of a sentence
                 padding='max_length',  # Add [PAD]s
                 return_attention_mask = True,  # Generate the attention mask
                 return_tensors = 'pt',  # ask the function to return PyTorch tensors
@@ -107,7 +109,7 @@ class Allen(Dataset):
                 df_val_match['sentence1'][index],  # the sentence to be encoded
                 df_val_match['sentence2'][index],
                 add_special_tokens=True,  # Add [CLS] and [SEP]
-                max_length = 1000,  # maximum length of a sentence
+                max_length = max_len,  # maximum length of a sentence
                 padding='max_length',  # Add [PAD]s
                 return_attention_mask = True,  # Generate the attention mask
                 return_tensors = 'pt',  # ask the function to return PyTorch tensors
@@ -123,7 +125,7 @@ class Allen(Dataset):
                 df_val_mismatch['sentence1'][index],  # the sentence to be encoded
                 df_val_mismatch['sentence2'][index],
                 add_special_tokens=True,  # Add [CLS] and [SEP]
-                max_length = 1000,  # maximum length of a sentence
+                max_length = max_len,  # maximum length of a sentence
                 padding='max_length',  # Add [PAD]s
                 return_attention_mask = True,  # Generate the attention mask
                 return_tensors = 'pt',  # ask the function to return PyTorch tensors
@@ -139,7 +141,7 @@ class Allen(Dataset):
                 df_test_match['sentence1'][index],  # the sentence to be encoded
                 df_test_match['sentence2'][index],
                 add_special_tokens=True,  # Add [CLS] and [SEP]
-                max_length = 1000,  # maximum length of a sentence
+                max_length = max_len,  # maximum length of a sentence
                 padding='max_length',  # Add [PAD]s
                 return_attention_mask = True,  # Generate the attention mask
                 return_tensors = 'pt',  # ask the function to return PyTorch tensors
@@ -150,17 +152,17 @@ class Allen(Dataset):
                 df_test_mismatch['sentence1'][index],  # the sentence to be encoded
                 df_test_mismatch['sentence2'][index],
                 add_special_tokens=True,  # Add [CLS] and [SEP]
-                max_length = 1000,  # maximum length of a sentence
+                max_length = max_len,  # maximum length of a sentence
                 padding='max_length',  # Add [PAD]s
                 return_attention_mask = True,  # Generate the attention mask
                 return_tensors = 'pt',  # ask the function to return PyTorch tensors
             )
             label = 0
 
-        input_ids = encoded['input_ids'][0][:128]
-        attn_mask = encoded['attention_mask'][0][:128]
-        token_type_ids = encoded['token_type_ids'][0][:128]
-        return input_ids.view(128), attn_mask.view(128), token_type_ids.view(128), torch.tensor(label, dtype=torch.long)
+        input_ids = encoded['input_ids'][0][:max_len]
+        attn_mask = encoded['attention_mask'][0][:max_len]
+        token_type_ids = encoded['token_type_ids'][0][:max_len]
+        return input_ids.view(max_len), attn_mask.view(max_len), token_type_ids.view(max_len), torch.tensor(label, dtype=torch.long)
 
     def __len__(self):
 
@@ -173,12 +175,11 @@ test_m_dataset = Allen('test_m')
 test_mm_dataset = Allen('test_mm')
 
 
-train_dataloader = DataLoader(train_dataset,batch_size=32,shuffle=True)
-
-val_m_dataloader = DataLoader(val_m_dataset,batch_size=16)
-val_mm_dataloader = DataLoader(val_mm_dataset,batch_size=16)
-test_m_dataloader = DataLoader(test_m_dataset,batch_size=16)
-test_mm_dataloader = DataLoader(test_mm_dataset,batch_size=32)
+train_dataloader = DataLoader(train_dataset,batch_size=batch_size,shuffle=True)
+val_m_dataloader = DataLoader(val_m_dataset,batch_size=batch_size/2)
+val_mm_dataloader = DataLoader(val_mm_dataset,batch_size=batch_size/2)
+test_m_dataloader = DataLoader(test_m_dataset,batch_size=batch_size)
+test_mm_dataloader = DataLoader(test_mm_dataset,batch_size=batch_size)
 
 
 # -
@@ -197,7 +198,7 @@ class Model(nn.Module):
             elif 'adapter' in name:
                 if 'bias' in name:
                     self.param_lst.append(param)
-                elif 'fix' in sys.argv[1] and 'vector' in name:
+                elif 'fix' in output_path and 'vector' in name:
                     print('大哥好，您把vector fix住了哦！！！')
                     param.requires_grad = False
                 else:
@@ -220,34 +221,13 @@ class Model(nn.Module):
         return answer
 
 
-
-# +
-def plotImage(G_losses, path, match):
-    print('Start to plot!!')
-    plt.figure(figsize=(10, 5))
-    plt.title("Corr During Epoch")
-    plt.plot(G_losses)
-    plt.xlabel('Epoch')
-    plt.ylabel("Corr")
-    #plt.legend()
-    if match == 'm':
-        plt.savefig(os.path.join(path, 'MNLI_m.png'))
-    else:
-        plt.savefig(os.path.join(path, 'MNLI_mm.png'))
-
-
 # +
 backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
 model = Model(backbond).to(device)
 loss_funtion = nn.CrossEntropyLoss()
-lr = 0.0001
 
 optimizer_weight = optim.AdamW(model.weight_lst, lr = lr)
 optimizer_bias = optim.AdamW(model.param_lst, lr = lr, weight_decay=0)
-
-path = sys.argv[1]
-model_m_path = os.path.join(path, 'MNLI_m.ckpt')
-model_mm_path = os.path.join(path, 'MNLI_mm.ckpt')
 
 print('Start training MNLI!!!')
 best_acc_m = 0
@@ -256,7 +236,7 @@ best_acc_mm = 0
 best_epoch_mm =0
 accuracy_m = []
 accuracy_mm = []
-for epoch in range(30):
+for epoch in range(args.mnli_epoch):
     epoch_start = time.time()
     model.train()
     correct = 0
@@ -318,12 +298,12 @@ for epoch in range(30):
     accuracy_mm.append(score_mm)
     if score_m >= best_acc_m:
         best_acc_m = score_m
-        best_epoch_m = epoch + 1
-        torch.save(model.state_dict(), model_m_path)
+        best_epoch_m = epoch
+        torch.save(model.state_dict(), os.path.join(model_path, 'MNLI_m.ckpt'))
     if score_mm >= best_acc_mm:
         best_acc_mm = score_mm
-        best_epoch_mm = epoch + 1
-        torch.save(model.state_dict(), model_mm_path)
+        best_epoch_mm = epoch
+        torch.save(model.state_dict(), os.path.join(model_path, 'MNLI_mm.ckpt'))
         
     end = time.time()
     print('epoch = ', epoch+1)
@@ -332,36 +312,14 @@ for epoch in range(30):
     print('best epoch mismatch = ', best_epoch_mm +1)
     print('best cor mismatch = ', best_acc_mm)
     if epoch == 0:
-        print('預計train時間 = ', 30*(end-epoch_start)/60, '分鐘')
+        print('預計train時間 = ', args.mnli_epoch*(end-epoch_start)/60, '分鐘')
     print('=====================================')
-#plotImage(accuracy_m,path,'m')
-#plotImage(accuracy_mm,path,'mm')
-
-'''
-write_path = os.path.join(path, 'MNLI.txt')
-f = open(write_path, 'w')
-f.write("Task = MNLI-m\n")
-f.write("Total epoch = " + str(epoch + 1) + '\n')
-f.write("Train accuracy = " + str(train_score) + '\n')
-f.write("Pick best epoch = " + str(best_epoch_m + 1) + '\n')
-f.write("Pick best accuracy = " + str(best_acc_m) + '\n')
-f.write("Task = MNLI-mm\n")
-f.write("Total epoch = " + str(epoch + 1) + '\n')
-f.write("Pick best epoch = " + str(best_epoch_mm + 1) + '\n')
-f.write("Pick best accuracy = " + str(best_acc_mm) + '\n')
-f.close()
-'''
-
-print('Done MNLI!!!')
-
-backbond = BertModel.from_pretrained("bert-base-uncased").to(device)
 
 print('Start predict MNLI!!!')
 
 model = Model(backbond).to(device)
-ckpt = torch.load(os.path.join(path, 'MNLI_m.ckpt'))
+ckpt = torch.load(os.path.join(model_path, 'MNLI_m.ckpt'))
 model.load_state_dict(ckpt)
-
 model.eval()
 ans = []
 with torch.no_grad():
@@ -374,11 +332,7 @@ with torch.no_grad():
         for i in range(len(pred)):
             ans.append(int(pred[i]))
             
-output_path = sys.argv[1]
-
-output_file = os.path.join(output_path, 'MNLI-m.tsv')
-            
-with open(output_file, 'wt') as out_file:
+with open(os.path.join(pred_path, 'MNLI-m.tsv'), 'wt') as out_file:
     tsv_writer = csv.writer(out_file, delimiter='\t')
     tsv_writer.writerow(['Id', 'Label'])
     for idx, label in enumerate(ans):
@@ -389,13 +343,11 @@ with open(output_file, 'wt') as out_file:
         else:
             tsv_writer.writerow([idx, 'entailment'])
 
-
 model = Model(backbond).to(device)
-ckpt = torch.load(os.path.join(path, 'MNLI_mm.ckpt'))
+ckpt = torch.load(os.path.join(model_path, 'MNLI_mm.ckpt'))
 model.load_state_dict(ckpt)
 model.eval()
 ans = []
-
 with torch.no_grad():
     for batch_id, data in enumerate(tqdm(test_mm_dataloader)):
         tokens, mask, type_id, _ = data
@@ -406,11 +358,7 @@ with torch.no_grad():
         for i in range(len(pred)):
             ans.append(int(pred[i]))
             
-output_path = sys.argv[1]
-
-output_file = os.path.join(output_path, 'MNLI-mm.tsv')
-            
-with open(output_file, 'wt') as out_file:
+with open(os.path.join(pred_path, 'MNLI-mm.tsv'), 'wt') as out_file:
     tsv_writer = csv.writer(out_file, delimiter='\t')
     tsv_writer.writerow(['Id', 'Label'])
     for idx, label in enumerate(ans):
@@ -420,4 +368,3 @@ with open(output_file, 'wt') as out_file:
             tsv_writer.writerow([idx, 'neutral'])
         else:
             tsv_writer.writerow([idx, 'entailment'])
-
