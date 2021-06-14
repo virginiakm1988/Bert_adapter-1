@@ -187,5 +187,5 @@ def main():
     runner = Runner(args, config)
     eval(f'runner.{args.mode}')()
 
-    if __name__ == '__main__':
+if __name__ == '__main__':
     main()
